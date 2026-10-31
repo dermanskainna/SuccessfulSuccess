@@ -2,7 +2,7 @@
 
 import { zodResolver } from "@hookform/resolvers/zod"
 import { CalendarIcon } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useEffect, useState, useRef } from "react"
 import { Controller, useForm } from "react-hook-form"
 import { toast } from "sonner"
 import { z } from "zod"
@@ -132,14 +132,20 @@ export function MeetingFormDialog({
   const {
     register,
     handleSubmit,
+    setValue,
     control,
     reset,
     setError,
     formState: { errors, isSubmitting },
   } = form
 
-  // Refill the form each time it opens, so edits start from the meeting's current values.
-  useEffect(() => {
+  // ---- Agenda‑parsing UI state ----
+  const [agendaText, setAgendaText] = useState('');
+  const [isParsing, setIsParsing] = useState(false);
+  const [agendaMeta, setAgendaMeta] = useState<Record<string, any> | null>(null);
+  const [suggestedFields, setSuggestedFields] = useState<Set<string>>(new Set());
+  const abortControllerRef = useRef<AbortController | null>(null);
+
     if (open) reset(defaultValues(meeting))
   }, [open, meeting, reset])
 
@@ -194,7 +200,7 @@ export function MeetingFormDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90svh] overflow-y-auto sm:max-w-lg">
-        <DialogHeader>
+        </DialogHeader>
           <DialogTitle>{isEdit ? "Edit meeting" : "New meeting"}</DialogTitle>
           <DialogDescription>
             {isEdit

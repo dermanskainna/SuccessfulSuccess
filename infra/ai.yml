@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  LLM agenda parsing stack (successfulsuccess-ai).
+  Lambda runs outside VPC, exposes Function URL (CORS), calls Bedrock (Anthropic).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: successfulsuccess
+    Description: Project name used for naming resources.
+  ImageUri:
+    Type: String
+    Description: ECR image URI (including tag or digest).
+  Architecture:
+    Type: String
+    Default: x86_64
+    AllowedValues: [x86_64, arm64]
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda timeout in seconds.
+
+Resources:
+  # ---------------------------------------------------------------------
+  # IAM role for the agenda parser Lambda
+  # ---------------------------------------------------------------------
+  AIParserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-agenda-parser"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockInference
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-mantle:CreateInference
+                Resource: '*'
+
+  # ---------------------------------------------------------------------
+  # Lambda function (outside VPC)
+  # ---------------------------------------------------------------------
+  AIParserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-agenda-parser"
+      Description: Parses meeting agenda using Anthropic Bedrock (outside VPC).
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command: ["app.ai.agenda_lambda.handler"]
+      Architectures:
+        - !Ref Architecture
+      Role: !GetAtt AIParserRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref AIParserLogGroup
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+
+  AIParserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-agenda-parser"
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------------
+  # Lambda Function URL (public, CORS enabled)
+  # ---------------------------------------------------------------------
+  AIParserFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt AIParserFunction.Arn
+      AuthType: NONE
+      Cors:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+        AllowHeaders:
+          - "Content-Type"
+          - "Authorization"
+        MaxAge: 86400
+
+Outputs:
+  AIParserFunctionName:
+    Description: Name of the agenda‑parser Lambda function
+    Value: !Ref AIParserFunction
+  AIParserFunctionUrl:
+    Description: Public URL for the parser Lambda
+    Value: !GetAtt AIParserFunctionUrl.FunctionUrl
+

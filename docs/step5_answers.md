@@ -56,3 +56,4 @@ REPORT RequestId: cfa2a709-9e3b-424d-aaaa-7ed7534331f7 Duration: 863.38 ms Bille
 
 3. **How does using EventBridge Scheduler compare to traditional cron jobs on an EC2 instance?**  
    EventBridge Scheduler is a fully managed, serverless scheduling service. Unlike cron jobs running on an EC2 instance, EventBridge Scheduler requires zero server maintenance, scales automatically, incurs no cost when idle, and provides built-in retry policies and Dead-Letter Queues (DLQ) for failed executions.
+
