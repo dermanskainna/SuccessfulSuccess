@@ -12,7 +12,7 @@ import csv
 import io
 from datetime import date, timedelta
 
-from sqlalchemy import func, select, text
+from sqlalchemy import Date, cast, func, select, text
 
 from app.db import SessionFactory
 from app.models.meeting import Meeting, Participant
@@ -27,20 +27,19 @@ def _previous_iso_week() -> str:
     return f"{iso[0]}-W{iso[1]:02d}"
 
 
-def _week_bounds(week: str) -> tuple[str, str]:
-    """Повертає (понеділок, неділя) ISO-тижня у форматі 'YYYY-MM-DD'.
+def _week_bounds(week: str) -> tuple[date, date]:
+    """Повертає (понеділок, неділя) ISO-тижня у вигляді об'єктів date.
 
     Наприклад, для '2026-W40':
-      Monday = 2026-09-28, Sunday = 2026-10-04
+        Monday = 2026-09-28, Sunday = 2026-10-04
     """
-    # Python 3.8+: date.fromisocalendar(year, week, day)
     year, w = week.split("-W")
     monday = date.fromisocalendar(int(year), int(w), 1)
     sunday = monday + timedelta(days=6)
-    return str(monday), str(sunday)
+    return monday, sunday
 
 
-async def _fetch_week_data(week_start: str, week_end: str) -> list[Meeting]:
+async def _fetch_week_data(week_start: date, week_end: date) -> list[Meeting]:
     """Завантажує зустрічі за вказаний інтервал дат з БД."""
     async with SessionFactory() as session:
         result = await session.execute(
@@ -57,7 +56,7 @@ async def _fetch_week_data(week_start: str, week_end: str) -> list[Meeting]:
         return list(result.scalars().all())
 
 
-async def _fetch_week_summary(week_start: str, week_end: str) -> tuple[int, float]:
+async def _fetch_week_summary(week_start: date, week_end: date) -> tuple[int, float]:
     """Повертає (кількість_зустрічей, сума_годин) за інтервал дат."""
     async with SessionFactory() as session:
         row = await session.execute(
@@ -118,8 +117,8 @@ def build_weekly_report(week: str | None = None) -> bytes:
     # Секція 1: Загальна статистика
     writer.writerow(["section", "metric", "value"])
     writer.writerow(["summary", "week", week])
-    writer.writerow(["summary", "week_start", week_start])
-    writer.writerow(["summary", "week_end", week_end])
+    writer.writerow(["summary", "week_start", str(week_start)])
+    writer.writerow(["summary", "week_end", str(week_end)])
     writer.writerow(["summary", "total_meetings", curr_count])
     writer.writerow(["summary", "total_hours", f"{curr_hours:.2f}"])
     writer.writerow(["summary", "prev_week", prev_week])
@@ -159,4 +158,3 @@ def build_weekly_report(week: str | None = None) -> bytes:
 
     # BOM (\ufeff) для сумісності з Excel
     return ("\ufeff" + output.getvalue()).encode("utf-8")
-

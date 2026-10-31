@@ -106,6 +106,10 @@ def builder_handler(event: dict, context: object) -> dict:
     return {"status": "ok", "bucket": bucket, "key": key, "week": week}
 
 
+# Аліас для універсального виклику app.reports.lambda_handler.handler
+handler = builder_handler
+
+
 # ---------------------------------------------------------------------------
 # Mailer: читає CSV з S3, надсилає email через SES v2
 # ---------------------------------------------------------------------------

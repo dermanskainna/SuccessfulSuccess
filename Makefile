@@ -352,16 +352,80 @@ aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront, built against th
 aws-frontend-url: ## Print the deployed site URL
 	@$(call stack-output,$(FRONTEND_STACK),SiteUrl)
 
+aws-deploy-reports: aws-push ## Deploy the event-driven weekly reports stack (S3, SQS, EventBridge, Lambdas, SES)
+	$(require-aws-credentials)
+	@vpc=$$($(AWS) ec2 describe-vpcs --filters Name=isDefault,Values=true \
+		--query 'Vpcs[0].VpcId' --output text | tr -d '[:space:]'); \
+		subnets=$$($(AWS) ec2 describe-subnets \
+			--filters Name=vpc-id,Values=$$vpc Name=default-for-az,Values=true \
+			--query 'Subnets[].SubnetId' --output text | tr '[:space:]' ',' | sed 's/,*$$//'); \
+		rts=$$($(AWS) ec2 describe-route-tables --filters Name=vpc-id,Values=$$vpc \
+			--query 'RouteTables[*].RouteTableId' --output text | tr '[:space:]' ',' | sed 's/,*$$//'); \
+		repo=$$($(call stack-output,$(ECR_STACK),RepositoryUri) | tr -d '[:space:]'); \
+		digest=$$($(AWS) ecr describe-images --repository-name "$${repo#*/}" \
+			--image-ids imageTag=$(IMAGE_TAG) --query 'imageDetails[0].imageDigest' \
+			--output text | tr -d '[:space:]'); \
+		db_endpoint=$$($(call stack-output,$(APP_STACK),DatabaseEndpoint) | tr -d '[:space:]'); \
+		fn=$$($(call stack-output,$(APP_STACK),FunctionName) | tr -d '[:space:]'); \
+		sg=$$($(AWS) lambda get-function-configuration --function-name "$$fn" \
+			--query 'VpcConfig.SecurityGroupIds[0]' --output text | tr -d '[:space:]'); \
+		db_url="postgresql+asyncpg://$(POSTGRES_USER):$(AWS_DB_PASSWORD)@$$db_endpoint:5432/$(POSTGRES_DB)"; \
+		sender="$(or $(REPORT_SENDER),reports@example.com)"; \
+		recipient="$(or $(REPORT_RECIPIENT),admin@example.com)"; \
+		echo "Deploying reports stack (VPC=$$vpc, Subnets=$$subnets, RouteTables=$$rts)"; \
+		$(call wait-stack-idle,$(REPORTS_STACK)); \
+		$(call clear-failed-create,$(REPORTS_STACK)); \
+		$(AWS) cloudformation deploy \
+			--stack-name $(REPORTS_STACK) \
+			--template-file infra/reports.yml \
+			--capabilities CAPABILITY_NAMED_IAM \
+			--no-fail-on-empty-changeset \
+			$(STACK_TAGS) \
+			--parameter-overrides \
+				"ProjectName=$(PROJECT_NAME)" \
+				"VpcId=$$vpc" \
+				"SubnetIds=$$subnets" \
+				"RouteTableIds=$$rts" \
+				"SecurityGroupId=$$sg" \
+				"ImageUri=$$repo@$$digest" \
+				"Architecture=$(AWS_LAMBDA_ARCH)" \
+				"DatabaseUrl=$$db_url" \
+				"ReportSenderEmail=$$sender" \
+				"ReportRecipientEmail=$$recipient"
+
+report-now: ## Trigger a weekly report manually via SQS: make report-now [WEEK=2026-W40]
+	$(require-aws-credentials)
+	@q_url=$$($(call stack-output,$(REPORTS_STACK),ReportRequestsQueueUrl) 2>/dev/null | tr -d '[:space:]'); \
+		test -n "$$q_url" -a "$$q_url" != "None" || { \
+			echo "Reports stack is not deployed or queue not found. Run make aws-deploy-reports first."; exit 1; }; \
+		if [ -n "$(WEEK)" ]; then \
+			payload='{"week": "$(WEEK)", "source": "manual"}'; \
+		else \
+			payload='{"week": null, "source": "manual"}'; \
+		fi; \
+		echo "Dispatching report request to SQS: $$payload"; \
+		$(AWS) sqs send-message \
+			--queue-url "$$q_url" \
+			--message-body "$$payload" \
+			--query 'MessageId' --output text
+
 aws-destroy: ## Delete every stack, including the database and its data
 	$(require-aws-credentials)
-	@printf 'Delete %s, %s, %s and %s? The Aurora cluster and all its data, and every user account, go with them (no snapshot). Type yes: ' \
-		"$(FRONTEND_STACK)" "$(APP_STACK)" "$(AUTH_STACK)" "$(ECR_STACK)"; \
+	@printf 'Delete %s, %s, %s, %s and %s? The Aurora cluster and all its data, and every user account, go with them (no snapshot). Type yes: ' \
+		"$(REPORTS_STACK)" "$(FRONTEND_STACK)" "$(APP_STACK)" "$(AUTH_STACK)" "$(ECR_STACK)"; \
 		read answer; test "$$answer" = "yes" || { echo "Aborted."; exit 1; }
 	@bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) 2>/dev/null | tr -d '[:space:]'); \
 		if [ -n "$$bucket" ] && [ "$$bucket" != "None" ]; then \
 			echo "Emptying s3://$$bucket"; \
 			$(AWS) s3 rm "s3://$$bucket" --recursive --only-show-errors || true; \
 		fi
+	@rbucket=$$($(call stack-output,$(REPORTS_STACK),ReportsBucketName) 2>/dev/null | tr -d '[:space:]'); \
+		if [ -n "$$rbucket" ] && [ "$$rbucket" != "None" ]; then \
+			echo "Emptying s3://$$rbucket"; \
+			$(AWS) s3 rm "s3://$$rbucket" --recursive --only-show-errors || true; \
+		fi
+	-$(AWS) cloudformation delete-stack --stack-name $(REPORTS_STACK)
+	-$(AWS) cloudformation wait stack-delete-complete --stack-name $(REPORTS_STACK)
 	-$(AWS) cloudformation delete-stack --stack-name $(FRONTEND_STACK)
 	-$(AWS) cloudformation wait stack-delete-complete --stack-name $(FRONTEND_STACK)
 	@echo "Deleting $(APP_STACK) — Lambda releases its VPC network interfaces slowly, allow ~20 minutes."

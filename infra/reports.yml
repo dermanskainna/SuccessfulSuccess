@@ -40,6 +40,12 @@ Parameters:
         aws ec2 describe-route-tables --filters Name=vpc-id,Values=<VPC_ID>
           --query "RouteTables[*].RouteTableId" --output text
 
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      Security Group для Lambda-будівника (та сама, що й для backend-функції,
+      має доступ до Aurora на порт 5432).
+
   # SES-ідентифікатори
   ReportSenderEmail:
     Type: String
@@ -84,10 +90,20 @@ Resources:
   # S3: кошик для CSV-звітів
   # ==========================================================================
 
+  # Дозвіл S3 викликати Mailer Lambda (має бути створений перед конфігурацією сповіщень)
+  S3InvokeMailerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt MailerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${ProjectName}-reports-${AWS::AccountId}"
+      SourceAccount: !Ref AWS::AccountId
+
   ReportsBucket:
     Type: AWS::S3::Bucket
-    # Іменований кошик потрібен, щоб задати NotificationConfiguration без
-    # циклічних залежностей (S3 → Lambda Permission → Lambda → S3).
+    DependsOn:
+      - S3InvokeMailerPermission
     Properties:
       BucketName: !Sub "${ProjectName}-reports-${AWS::AccountId}"
       AccessControl: Private
@@ -102,38 +118,20 @@ Resources:
             Status: Enabled
             Prefix: reports/
             ExpirationInDays: 90
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "reports/"
+                  - Name: suffix
+                    Value: ".csv"
+            Function: !GetAtt MailerFunction.Arn
       Tags:
         - Key: PROJECT_NAME
           Value: !Ref ProjectName
-
-  # Дозвіл S3 викликати Mailer Lambda (має бути до NotificationConfiguration)
-  S3InvokeMailerPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt MailerFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: s3.amazonaws.com
-      SourceArn: !Sub "arn:aws:s3:::${ProjectName}-reports-${AWS::AccountId}"
-      SourceAccount: !Ref AWS::AccountId
-
-  # Налаштування S3-сповіщень (окремий ресурс — CloudFormation custom resource
-  # не потрібен завдяки явному іменуванню кошика та DependsOn)
-  ReportsBucketNotification:
-    Type: AWS::S3::BucketNotification
-    DependsOn:
-      - S3InvokeMailerPermission
-    Properties:
-      Bucket: !Ref ReportsBucket
-      LambdaConfigurations:
-        - Event: "s3:ObjectCreated:*"
-          Filter:
-            S3Key:
-              Rules:
-                - Name: prefix
-                  Value: "reports/"
-                - Name: suffix
-                  Value: ".csv"
-          Function: !GetAtt MailerFunction.Arn
 
   # ==========================================================================
   # VPC Endpoint: Gateway для S3 (безкоштовний)
@@ -310,26 +308,6 @@ Resources:
           Value: !Ref ProjectName
 
   # ==========================================================================
-  # Security Group для Builder Lambda (VPC)
-  # ==========================================================================
-
-  BuilderSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: !Sub "${ProjectName} report builder (VPC, no inbound)"
-      VpcId: !Ref VpcId
-      # Лише egress — до S3 Gateway Endpoint та Aurora
-      SecurityGroupEgress:
-        - IpProtocol: "-1"
-          CidrIp: "0.0.0.0/0"
-          Description: Allow all outbound (S3 via Gateway Endpoint, RDS inside VPC)
-      Tags:
-        - Key: Name
-          Value: !Sub "${ProjectName}-report-builder"
-        - Key: PROJECT_NAME
-          Value: !Ref ProjectName
-
-  # ==========================================================================
   # Lambda: будівник звітів (у VPC)
   # ==========================================================================
 
@@ -354,7 +332,7 @@ Resources:
       VpcConfig:
         SubnetIds: !Ref SubnetIds
         SecurityGroupIds:
-          - !Ref BuilderSecurityGroup
+          - !Ref SecurityGroupId
       Environment:
         Variables:
           REPORT_BUCKET: !Sub "${ProjectName}-reports-${AWS::AccountId}"
