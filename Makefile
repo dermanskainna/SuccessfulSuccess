@@ -65,9 +65,10 @@ clear-failed-create = if [ "$$($(AWS) cloudformation describe-stacks --stack-nam
 
 # Fail early and clearly when .env has no credentials in it.
 define require-aws-credentials
-	@test -n "$(AWS_ACCESS_KEY_ID)" -a -n "$(AWS_SECRET_ACCESS_KEY)" || { \
+	@if [ -z "$(AWS_ACCESS_KEY_ID)" ] || [ -z "$(AWS_SECRET_ACCESS_KEY)" ]; then \
 		echo "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are empty — set them in .env"; \
-		exit 1; }
+		exit 1; \
+	fi
 endef
 
 define require-db-password

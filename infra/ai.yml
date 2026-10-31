@@ -19,6 +19,10 @@ Parameters:
     Type: Number
     Default: 30
     Description: Lambda timeout in seconds.
+  LogLevel:
+    Type: String
+    Default: INFO
+    Description: Log level for Lambda (e.g., DEBUG, INFO)
 
 Resources:
   # ---------------------------------------------------------------------
@@ -37,6 +41,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
       Policies:
         - PolicyName: BedrockInference
           PolicyDocument:
