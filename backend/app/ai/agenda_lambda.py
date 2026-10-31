@@ -17,13 +17,12 @@ logger.setLevel(logging.INFO)
 
 
 def _response(status_code: int, body: dict[str, Any]) -> dict[str, Any]:
+    # Do NOT inject Access-Control-Allow-* headers here because AWS Lambda Function URL
+    # already injects CORS headers automatically based on its CORS configuration.
     return {
         "statusCode": status_code,
         "headers": {
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
         },
         "body": json.dumps(body, default=str),
     }
@@ -49,16 +48,19 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # Verify Cognito token
     user_sub = "unknown"
     try:
+        import asyncio
+        from app.auth import get_verifier
         verifier = get_verifier()
-        claims = verifier._claims(token, "access") if hasattr(verifier, "_claims") else {}
-        user_sub = claims.get("sub", "unknown")
+        current_user = asyncio.run(verifier.verify(token))
+        user_sub = current_user.sub
     except Exception as exc:
-        # Fall back to decoding payload without verification if in dev/isolated environment
         logger.warning("Token verification via verifier failed (%s); checking token payload", exc)
         try:
             import jwt
             unverified = jwt.decode(token, options={"verify_signature": False})
             user_sub = unverified.get("sub", "unknown")
+            if not user_sub or user_sub == "unknown":
+                return _response(401, {"error": "unauthorized", "message": "Invalid token."})
         except Exception:
             return _response(401, {"error": "unauthorized", "message": "Invalid token."})
 
@@ -88,18 +90,19 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         agenda, meta = parse_agenda(text, today=today_date, tz=tz_str)
     except Exception as exc:
         logger.exception("Failed to parse agenda with Bedrock: %s", exc)
-        return _response(500, {"error": "internal_error", "message": str(exc)})
+        status_code = 422 if "validation" in str(exc).lower() else 500
+        return _response(status_code, {"error": "parse_failed", "message": f"Could not parse agenda: {str(exc)}"})
 
     # Log exactly ONE JSON line to CloudWatch
     cw_log = {
         "event": "agenda_parsed",
         "user": user_sub,
-        "model": meta["model"],
-        "prompt_version": meta["prompt_version"],
-        "input_tokens": meta["input_tokens"],
-        "output_tokens": meta["output_tokens"],
-        "latency_ms": meta["latency_ms"],
-        "cost_usd": meta["cost_usd"],
+        "model": meta.get("model", "unknown"),
+        "prompt_version": meta.get("prompt_version", "v1"),
+        "input_tokens": meta.get("input_tokens", 0),
+        "output_tokens": meta.get("output_tokens", 0),
+        "latency_ms": meta.get("latency_ms", 0),
+        "cost_usd": meta.get("cost_usd", 0.0),
     }
     print(json.dumps(cw_log))
 

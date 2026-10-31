@@ -105,7 +105,6 @@ def parse_agenda(text: str, today: date, tz: str) -> Tuple[ParsedAgenda, Dict[st
         response = client.messages.create(
             model=model,
             max_tokens=2048,
-            temperature=0,
             system=system_prompt,
             tools=[record_agenda],
             tool_choice={"type": "tool", "name": "record_agenda"},
@@ -117,7 +116,6 @@ def parse_agenda(text: str, today: date, tz: str) -> Tuple[ParsedAgenda, Dict[st
         response = client.messages.create(
             model=model,
             max_tokens=2048,
-            temperature=0,
             system=(
                 f"{system_prompt}\nReturn ONLY valid JSON matching this schema:\n"
                 f"{json.dumps(ParsedAgenda.model_json_schema())}"
