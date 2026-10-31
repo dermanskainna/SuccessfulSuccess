@@ -201,7 +201,7 @@ export function MeetingFormDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90svh] overflow-y-auto sm:max-w-lg">
-        </DialogHeader>
+        <DialogHeader>
           <DialogTitle>{isEdit ? "Edit meeting" : "New meeting"}</DialogTitle>
           <DialogDescription>
             {isEdit
@@ -238,6 +238,44 @@ export function MeetingFormDialog({
             {errors.description ? (
               <p className="text-destructive text-sm">{errors.description.message}</p>
             ) : null}
+          </div>
+          {/* Paste an agenda */}
+          <div className="space-y-2">
+            <Label htmlFor="agenda">Paste an agenda</Label>
+            <Textarea
+              id="agenda"
+              rows={5}
+              placeholder="Paste meeting agenda here..."
+              value={agendaText}
+              onChange={e => setAgendaText(e.target.value)}
+              disabled={isParsing}
+            />
+            <Button
+              type="button"
+              onClick={async () => {
+                if (!agendaText.trim()) return;
+                setIsParsing(true);
+                try {
+                  const response = await fetch(`${process.env.NEXT_PUBLIC_API_BASE_URL}/ai/agenda`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ text: agendaText })
+                  });
+                  const data = await response.json();
+                  if (data.title) setValue("name", data.title);
+                  if (data.description) setValue("description", data.description);
+                  if (data.location) setValue("location", data.location);
+                  toast.success("Agenda parsed");
+                } catch (e) {
+                  toast.error("Failed to parse agenda");
+                } finally {
+                  setIsParsing(false);
+                }
+              }}
+              disabled={isParsing}
+            >
+              {isParsing ? "Parsing…" : "Parse Agenda"}
+            </Button>
           </div>
 
           <div className="space-y-2">
