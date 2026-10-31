@@ -146,8 +146,9 @@ export function MeetingFormDialog({
   const [suggestedFields, setSuggestedFields] = useState<Set<string>>(new Set());
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  useEffect(() => {
     if (open) reset(defaultValues(meeting))
-  }, [open, meeting, reset])
+  }, [open, meeting, reset]);
 
   const onSubmit = handleSubmit(async (values) => {
     const participants = values.participants
