@@ -1,17 +1,31 @@
-FROM public.ecr.aws/lambda/python:3.12
+FROM python:3.12-slim
 
-# Set working directory
-WORKDIR /var/task
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/usr/local
 
-# Copy project files
+ARG INSTALL_DEV=false
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
 COPY pyproject.toml ./
+RUN if [ "$INSTALL_DEV" = "true" ]; then uv sync --no-install-project; \
+    else uv sync --no-install-project --no-dev; fi
 
-# Install UV (Python package manager) and project dependencies
-RUN pip install uv && \
-    uv sync --no-install-project --no-dev
-
-# Copy the rest of the source code
 COPY . .
 
-# Lambda expects the handler function; set CMD accordingly
-CMD ["app.ai.agenda_lambda.handler"]
+RUN useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+
+CMD ["app.main.handler"]

@@ -1,33 +1,41 @@
 # -*- coding: utf-8 -*-
-"""Agenda parsing module using Anthropic Bedrock.
+"""Agenda parsing module using Anthropic Bedrock (Anthropic Messages API on Bedrock).
 
-Provides Pydantic models representing a meeting agenda and a helper
-function `parse_agenda` that calls the Claude model to convert a free‑form
+Provides Pydantic models representing a meeting agenda and helper
+function `parse_agenda` that calls the Claude model to convert a free-form
 text agenda into structured data.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from datetime import date, datetime
-from typing import Tuple, Dict, Any
+from typing import Any, Dict, Tuple
 
-from anthropic import AnthropicBedrock, Completion, Message
-from pydantic import BaseModel, Field, ValidationError
+try:
+    from anthropic import AnthropicBedrockMantle, AnthropicBedrock
+except ImportError:
+    AnthropicBedrockMantle = None
+    AnthropicBedrock = None
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+logger = logging.getLogger("meetings.ai.agenda")
+
+# Pricing for anthropic.claude-opus-5-5: $4.00 / MTok in, $20.00 / MTok out
+INPUT_COST_PER_MTOK = 4.00
+OUTPUT_COST_PER_MTOK = 20.00
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 
 class AgendaItem(BaseModel):
-    """Single agenda item.
-
-    * ``topic`` – the subject of discussion.
-    * ``owner`` – optional person responsible for the item.
-    * ``minutes`` – optional allocated time in minutes.
-    """
+    """Single agenda item."""
+    model_config = ConfigDict(extra="ignore")
 
     topic: str
     owner: str | None = None
@@ -35,11 +43,8 @@ class AgendaItem(BaseModel):
 
 
 class ActionItem(BaseModel):
-    """Action‑item derived from the agenda.
-
-    * ``task`` – description of the action.
-    * ``owner`` – optional assignee.
-    * ``due`` – optional due‑date (ISO format)."""
+    """Action item derived from the agenda."""
+    model_config = ConfigDict(extra="ignore")
 
     task: str
     owner: str | None = None
@@ -47,127 +52,115 @@ class ActionItem(BaseModel):
 
 
 class ParsedAgenda(BaseModel):
-    """Full parsed agenda returned by the LLM.
-
-    * ``title`` – agenda title.
-    * ``starts_at`` – start datetime of the meeting (UTC).
-    * ``duration_minutes`` – total meeting length.
-    * ``items`` – list of agenda items.
-    * ``action_items`` – derived action items.
-    * ``language`` – detected language (optional).
-    """
+    """Full parsed agenda returned by the LLM."""
+    model_config = ConfigDict(
+        extra="ignore",
+        json_encoders={datetime: lambda v: v.isoformat(), date: lambda v: v.isoformat()}
+    )
 
     title: str
     starts_at: datetime
     duration_minutes: int
-    items: list[AgendaItem]
-    action_items: list[ActionItem]
+    items: list[AgendaItem] = Field(default_factory=list)
+    action_items: list[ActionItem] = Field(default_factory=list)
     language: str | None = None
 
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat(), date: lambda v: v.isoformat()}
 
-# ---------------------------------------------------------------------------
-# Tool definition (used by the LLM in higher‑level workflows)
-# ---------------------------------------------------------------------------
-
+# Tool definition for Claude tool use
 record_agenda = {
     "name": "record_agenda",
     "description": "Store a parsed agenda in the system.",
     "input_schema": ParsedAgenda.model_json_schema(),
 }
 
-# ---------------------------------------------------------------------------
-# Helper – system prompt for the model
-# ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = (
-    "You are an agenda‑parsing assistant. Convert the user‑provided free‑form "
-    "meeting agenda into a JSON object that conforms exactly to the following "
-    "schema (generated from the Pydantic model `ParsedAgenda`).\n"
-    "- Preserve the order of items.\n"
-    "- Resolve relative dates (e.g. ‘next Monday’) based on the supplied "
-    "`today` date and `tz` timezone.\n"
-    "- Leave any field that cannot be inferred as `null`.\n"
-    "- Return **only** valid JSON – no explanations, no markdown.\n"
-    "If the JSON fails validation, you will be asked to retry once with the "
-    "validation error details."
-)
-
-# ---------------------------------------------------------------------------
-# Core function
-# ---------------------------------------------------------------------------
-
-def _call_model(messages: list[dict[str, str]]) -> Tuple[Message, Dict[str, Any]]:
-    """Invoke Claude via Bedrock and return the raw response plus usage metadata.
-
-    The function measures latency and extracts cost/usage information from the
-    Bedrock response to be attached to the caller's telemetry.
-    """
-
+def _get_client():
     region = os.getenv("AWS_REGION", "us-east-1")
-    model = os.getenv("PARSER_MODEL", "anthropic.claude-opus-5-5")
-    client = AnthropicBedrock(region_name=region)
-
-    start = time.time()
-    response = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        temperature=0,
-        system=_SYSTEM_PROMPT,
-        messages=messages,
-    )
-    latency_ms = int((time.time() - start) * 1000)
-    usage = getattr(response, "usage", None)
-    meta = {
-        "model": model,
-        "prompt_version": "v1",
-        "latency_ms": latency_ms,
-        "cost_usd": getattr(usage, "total_cost", None) if usage else None,
-    }
-    return response, meta
+    if AnthropicBedrockMantle is not None:
+        try:
+            return AnthropicBedrockMantle(aws_region=region)
+        except Exception:
+            pass
+    if AnthropicBedrock is not None:
+        return AnthropicBedrock(aws_region=region)
+    raise RuntimeError("Anthropic Bedrock client is not available in environment.")
 
 
 def parse_agenda(text: str, today: date, tz: str) -> Tuple[ParsedAgenda, Dict[str, Any]]:
-    """Parse a raw agenda text into a ``ParsedAgenda``.
+    """Parse raw agenda text into a ParsedAgenda using Claude on Amazon Bedrock."""
+    client = _get_client()
+    model = os.getenv("PARSER_MODEL", "anthropic.claude-opus-5-5")
+    prompt_version = "v1"
 
-    The function performs a single call to Claude. If the model's JSON output
-    does **not** validate against ``ParsedAgenda`` a second attempt is made –
-    the validation error is sent back to the model so it can correct the
-    structure.
-    """
+    system_prompt = (
+        f"You are an expert meeting agenda parser. Current date is {today.isoformat()} and timezone is {tz}.\n"
+        "Convert the meeting agenda provided by the user into structured JSON matching the tool `record_agenda`.\n"
+        "- Resolve relative dates and times based on the current date and timezone.\n"
+        "- Infer title, starts_at (ISO 8601 with timezone or UTC offset), duration_minutes, agenda items, and action items.\n"
+        "- If language is evident, record it (e.g. 'en', 'uk')."
+    )
 
-    # First attempt
-    messages = [{"role": "user", "content": text}]
-    response, meta = _call_model(messages)
-    raw = response.content[0].text.strip()
+    start_time = time.time()
     try:
-        agenda = ParsedAgenda.parse_raw(raw)
-        return agenda, meta
-    except ValidationError as err:
-        # Second attempt with error details
-        error_msg = f"Previous output failed validation: {err}\nPlease return valid JSON."
-        messages.append({"role": "assistant", "content": raw})
-        messages.append({"role": "user", "content": error_msg})
-        response2, meta2 = _call_model(messages)
-        raw2 = response2.content[0].text.strip()
-        agenda = ParsedAgenda.parse_raw(raw2)
-        # Merge usage metadata (sum latency, keep latest usage)
-        meta2["latency_ms"] = meta.get("latency_ms", 0) + meta2.get("latency_ms", 0)
-        return agenda, meta2
+        response = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            temperature=0,
+            system=system_prompt,
+            tools=[record_agenda],
+            tool_choice={"type": "tool", "name": "record_agenda"},
+            messages=[{"role": "user", "content": text}],
+        )
+    except Exception as exc:
+        logger.warning("Tool call to Claude failed (%s), attempting text-based parse...", exc)
+        # Fallback to direct prompt with schema instruction if tool call endpoint fails
+        response = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            temperature=0,
+            system=(
+                f"{system_prompt}\nReturn ONLY valid JSON matching this schema:\n"
+                f"{json.dumps(ParsedAgenda.model_json_schema())}"
+            ),
+            messages=[{"role": "user", "content": text}],
+        )
 
-# ---------------------------------------------------------------------------
-# Simple CLI entry‑point for manual testing (invoked via `make parse`)
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import sys
-    from datetime import date
+    latency_ms = int((time.time() - start_time) * 1000)
 
-    txt = os.getenv("TEXT")
-    if not txt:
-        print("Set TEXT env var, e.g. make parse TEXT=\"My agenda…\"")
-        sys.exit(1)
-    agenda_obj, meta = parse_agenda(txt, date.today(), os.getenv("TZ", "UTC"))
-    print(json.dumps(json.loads(agenda_obj.json()), ensure_ascii=False, indent=2))
-    print(json.dumps(meta, ensure_ascii=False, indent=2))
+    # Extract parsed data from tool call or text content
+    tool_input = None
+    for content in response.content:
+        if getattr(content, "type", None) == "tool_use" and getattr(content, "name", None) == "record_agenda":
+            tool_input = content.input
+            break
 
+    if tool_input is None:
+        raw_text = response.content[0].text.strip()
+        # Strip potential markdown fences
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("\n", 1)[1]
+            if raw_text.endswith("```"):
+                raw_text = raw_text.rsplit("```", 1)[0].strip()
+        tool_input = json.loads(raw_text)
+
+    parsed = ParsedAgenda.model_validate(tool_input)
+
+    usage = getattr(response, "usage", None)
+    input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+    output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+
+    cost_usd = round(
+        (input_tokens / 1_000_000.0 * INPUT_COST_PER_MTOK)
+        + (output_tokens / 1_000_000.0 * OUTPUT_COST_PER_MTOK),
+        6,
+    )
+
+    meta = {
+        "model": model,
+        "prompt_version": prompt_version,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "latency_ms": latency_ms,
+        "cost_usd": cost_usd,
+    }
+    return parsed, meta

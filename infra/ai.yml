@@ -23,6 +23,10 @@ Parameters:
     Type: String
     Default: INFO
     Description: Log level for Lambda (e.g., DEBUG, INFO)
+  FrontendOrigin:
+    Type: String
+    Default: "*"
+    Description: Allowed CORS origin for frontend
 
 Resources:
   # ---------------------------------------------------------------------
@@ -50,6 +54,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - bedrock-mantle:CreateInference
+                  - bedrock:InvokeModel
                 Resource: '*'
 
   # ---------------------------------------------------------------------
@@ -69,12 +74,17 @@ Resources:
         - !Ref Architecture
       Role: !GetAtt AIParserRole.Arn
       Timeout: !Ref LambdaTimeout
-      MemorySize: 256
+      MemorySize: 512
       LoggingConfig:
         LogGroup: !Ref AIParserLogGroup
       Environment:
         Variables:
           LOG_LEVEL: !Ref LogLevel
+          AWS_REGION: !Ref "AWS::Region"
+          COGNITO_USER_POOL_ID: "us-east-1_3S0UCWv42"
+          COGNITO_CLIENT_ID: "3rfpq2s4rhl2ap2n49lvpu0k35"
+          COGNITO_REGION: "us-east-1"
+          APP_TIMEZONE: "Europe/Kyiv"
 
   AIParserLogGroup:
     Type: AWS::Logs::LogGroup
@@ -92,20 +102,28 @@ Resources:
       AuthType: NONE
       Cors:
         AllowOrigins:
-          - "*"
+          - !Ref FrontendOrigin
         AllowMethods:
-          - GET
           - POST
+          - OPTIONS
         AllowHeaders:
           - "Content-Type"
           - "Authorization"
         MaxAge: 86400
 
+  # Permission allowing public invocation of the Function URL
+  AIParserFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AIParserFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
 Outputs:
   AIParserFunctionName:
-    Description: Name of the agenda‑parser Lambda function
+    Description: Name of the agenda-parser Lambda function
     Value: !Ref AIParserFunction
   AIParserFunctionUrl:
     Description: Public URL for the parser Lambda
     Value: !GetAtt AIParserFunctionUrl.FunctionUrl
-

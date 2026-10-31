@@ -4,7 +4,9 @@ import logging
 
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
+from mangum import Mangum
 from sqlalchemy import text
+
 
 from app.api.v1 import api_router
 from app.config import settings
@@ -50,3 +52,5 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+handler = Mangum(app, lifespan="off")
+
