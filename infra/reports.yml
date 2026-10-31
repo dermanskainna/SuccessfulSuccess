@@ -1,0 +1,470 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Подієво-орієнтована підсистема тижневих звітів:
+  S3-кошик для CSV-файлів, SQS-черга запитів, EventBridge Scheduler
+  (щопонеділка о 07:00 Kyiv), Lambda-будівник (у VPC), Lambda-розсилка
+  (поза VPC, з доступом до SES) та верифікація SES.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: successfulsuccess
+
+  # VPC та підмережі — ті самі, що й у backend.yml (будівник у VPC)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC, де розгорнуто backend-функцію та Aurora.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Приватні підмережі для Lambda-будівника (без NAT).
+
+  # ARN образу — той самий Dockerfile.lambda, що й основний backend
+  ImageUri:
+    Type: String
+    Description: >-
+      URI образу з ECR (pinned @sha256). Будівник та розсилка
+      використовують один і той самий образ, але різні CMD.
+
+  Architecture:
+    Type: String
+    Default: x86_64
+    AllowedValues: [x86_64, arm64]
+
+  RouteTableIds:
+    Type: List<String>
+    Description: >-
+      Ідентифікатори маршрутних таблиць підмереж, де запускається
+      будівник. Необхідні для S3 Gateway Endpoint (безкоштовний).
+      Отримайте командою:
+        aws ec2 describe-route-tables --filters Name=vpc-id,Values=<VPC_ID>
+          --query "RouteTables[*].RouteTableId" --output text
+
+  # SES-ідентифікатори
+  ReportSenderEmail:
+    Type: String
+    Description: >-
+      Email-адреса відправника (має бути верифікована в SES або
+      належати верифікованому домену).
+
+  ReportRecipientEmail:
+    Type: String
+    Description: >-
+      Email-адреса отримувача звітів. Верифікується як окремий
+      SES EmailIdentity.
+
+  # Кількість секунд таймауту будівника (для VisibilityTimeout SQS)
+  BuilderTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 10
+    MaxValue: 900
+    Description: Таймаут Lambda-будівника в секундах. SQS VisibilityTimeout = 6x.
+
+  DatabaseUrl:
+    Type: String
+    NoEcho: true
+    Description: >-
+      Connection URL до Aurora PostgreSQL у форматі
+      postgresql+asyncpg://user:pass@host:5432/db.
+      Береться з виходу стека backend (DatabaseEndpoint).
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+Conditions:
+  # Заглушка — завжди true, дозволяє використовувати !If у майбутньому
+  Always: !Equals ["yes", "yes"]
+
+Resources:
+
+  # ==========================================================================
+  # S3: кошик для CSV-звітів
+  # ==========================================================================
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    # Іменований кошик потрібен, щоб задати NotificationConfiguration без
+    # циклічних залежностей (S3 → Lambda Permission → Lambda → S3).
+    Properties:
+      BucketName: !Sub "${ProjectName}-reports-${AWS::AccountId}"
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireReportsAfter90Days
+            Status: Enabled
+            Prefix: reports/
+            ExpirationInDays: 90
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # Дозвіл S3 викликати Mailer Lambda (має бути до NotificationConfiguration)
+  S3InvokeMailerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt MailerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${ProjectName}-reports-${AWS::AccountId}"
+      SourceAccount: !Ref AWS::AccountId
+
+  # Налаштування S3-сповіщень (окремий ресурс — CloudFormation custom resource
+  # не потрібен завдяки явному іменуванню кошика та DependsOn)
+  ReportsBucketNotification:
+    Type: AWS::S3::BucketNotification
+    DependsOn:
+      - S3InvokeMailerPermission
+    Properties:
+      Bucket: !Ref ReportsBucket
+      LambdaConfigurations:
+        - Event: "s3:ObjectCreated:*"
+          Filter:
+            S3Key:
+              Rules:
+                - Name: prefix
+                  Value: "reports/"
+                - Name: suffix
+                  Value: ".csv"
+          Function: !GetAtt MailerFunction.Arn
+
+  # ==========================================================================
+  # VPC Endpoint: Gateway для S3 (безкоштовний)
+  # ==========================================================================
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      # Маршрутні таблиці підмереж, де знаходиться будівник.
+      RouteTableIds: !Ref RouteTableIds
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:aws:s3:::${ProjectName}-reports-${AWS::AccountId}"
+              - !Sub "arn:aws:s3:::${ProjectName}-reports-${AWS::AccountId}/*"
+              # ECR S3 bucket (потрібен для pull образу всередині VPC)
+              - "arn:aws:s3:::prod-us-east-1-starport-layer-bucket/*"
+              - "arn:aws:s3:::prod-us-east-1-starport-layer-bucket"
+
+  # ==========================================================================
+  # SQS: черга запитів на звіт + DLQ
+  # ==========================================================================
+
+  ReportRequestsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-report-requests-dlq"
+      MessageRetentionPeriod: 1209600  # 14 днів
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  ReportRequestsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-report-requests"
+      # VisibilityTimeout = 6 × BuilderTimeout (рекомендація AWS для SQS→Lambda)
+      # При BuilderTimeout=60 → VisibilityTimeout=360
+      VisibilityTimeout: 360
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReportRequestsDLQ.Arn
+        maxReceiveCount: 3
+
+  # ==========================================================================
+  # IAM: роль для Lambda-будівника (у VPC)
+  # ==========================================================================
+
+  BuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-report-builder"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Логи та управління ENI (VPC Lambda)
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        # Читання повідомлень з SQS (для EventSourceMapping)
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+      Policies:
+        - PolicyName: S3PutReports
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-reports-${AWS::AccountId}/reports/*"
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # ==========================================================================
+  # IAM: роль для Lambda-розсилки (поза VPC, SES + S3)
+  # ==========================================================================
+
+  MailerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-report-mailer"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadReports
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-reports-${AWS::AccountId}/reports/*"
+        - PolicyName: SESv2SendEmail
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sesv2:SendEmail
+                  - sesv2:SendRawEmail
+                Resource: "*"
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # ==========================================================================
+  # IAM: роль для EventBridge Scheduler (право відправляти в SQS)
+  # ==========================================================================
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-report-scheduler"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SendToReportQueue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ReportRequestsQueue.Arn
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # ==========================================================================
+  # CloudWatch Log Groups
+  # ==========================================================================
+
+  BuilderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-report-builder"
+      RetentionInDays: 14
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  MailerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-report-mailer"
+      RetentionInDays: 14
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # ==========================================================================
+  # Security Group для Builder Lambda (VPC)
+  # ==========================================================================
+
+  BuilderSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} report builder (VPC, no inbound)"
+      VpcId: !Ref VpcId
+      # Лише egress — до S3 Gateway Endpoint та Aurora
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: Allow all outbound (S3 via Gateway Endpoint, RDS inside VPC)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-report-builder"
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # ==========================================================================
+  # Lambda: будівник звітів (у VPC)
+  # ==========================================================================
+
+  BuilderFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: BuilderLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-report-builder"
+      Description: Генерує CSV-звіт і завантажує до S3 (у VPC)
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command: ["app.reports.lambda_handler.builder_handler"]
+      Architectures:
+        - !Ref Architecture
+      Role: !GetAtt BuilderRole.Arn
+      MemorySize: 256
+      Timeout: !Ref BuilderTimeout
+      LoggingConfig:
+        LogGroup: !Ref BuilderLogGroup
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref BuilderSecurityGroup
+      Environment:
+        Variables:
+          REPORT_BUCKET: !Sub "${ProjectName}-reports-${AWS::AccountId}"
+          LOG_LEVEL: !Ref LogLevel
+          DATABASE_URL: !Ref DatabaseUrl
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # ==========================================================================
+  # Lambda: розсилка звітів (поза VPC)
+  # ==========================================================================
+
+  MailerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MailerLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-report-mailer"
+      Description: Надсилає CSV-звіт email через SES v2 (поза VPC)
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command: ["app.reports.lambda_handler.mailer_handler"]
+      Architectures:
+        - !Ref Architecture
+      Role: !GetAtt MailerRole.Arn
+      MemorySize: 128
+      Timeout: 30
+      LoggingConfig:
+        LogGroup: !Ref MailerLogGroup
+      # Навмисно БЕЗ VpcConfig — потрібен інтернет для SES
+      Environment:
+        Variables:
+          REPORT_BUCKET: !Sub "${ProjectName}-reports-${AWS::AccountId}"
+          REPORT_SENDER: !Ref ReportSenderEmail
+          REPORT_RECIPIENT: !Ref ReportRecipientEmail
+          LOG_LEVEL: !Ref LogLevel
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # ==========================================================================
+  # SQS → Builder: EventSourceMapping
+  # ==========================================================================
+
+  BuilderSQSMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ReportRequestsQueue.Arn
+      FunctionName: !GetAtt BuilderFunction.Arn
+      BatchSize: 1
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  # ==========================================================================
+  # EventBridge Scheduler: щопонеділка о 07:00 Kyiv
+  # ==========================================================================
+
+  WeeklyReportSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-weekly-report"
+      Description: "Запускає тижневий звіт щопонеділка о 07:00 за київським часом"
+      ScheduleExpression: "cron(0 7 ? * MON *)"
+      ScheduleExpressionTimezone: "Europe/Kyiv"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt ReportRequestsQueue.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"week": null, "source": "schedule"}'
+
+  # ==========================================================================
+  # SES: верифікація email-адрес
+  # ==========================================================================
+
+  SenderEmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref ReportSenderEmail
+
+  RecipientEmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref ReportRecipientEmail
+
+# ==========================================================================
+# Outputs
+# ==========================================================================
+
+Outputs:
+  ReportsBucketName:
+    Description: S3-кошик для CSV-звітів
+    Value: !Sub "${ProjectName}-reports-${AWS::AccountId}"
+
+  ReportRequestsQueueUrl:
+    Description: URL SQS-черги для ручного запуску звітів
+    Value: !Ref ReportRequestsQueue
+
+  ReportRequestsQueueArn:
+    Description: ARN SQS-черги (для make report-now)
+    Value: !GetAtt ReportRequestsQueue.Arn
+
+  BuilderFunctionName:
+    Description: Ім'я Lambda-будівника
+    Value: !Ref BuilderFunction
+
+  MailerFunctionName:
+    Description: Ім'я Lambda-розсилки
+    Value: !Ref MailerFunction

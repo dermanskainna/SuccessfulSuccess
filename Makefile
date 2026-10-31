@@ -78,8 +78,11 @@ endef
 
 .PHONY: help up up-build down down-v logs ps migrate revision seed test lint fmt shell-backend psql \
         aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-deploy-backend aws-migrate aws-url aws-status aws-logs \
-        aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy
+        aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy \
+        aws-deploy-reports report-now
 
+REPORTS_STACK ?= $(PROJECT_NAME)-reports
+WEEK ?=
 help:
 	@grep -hE '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
