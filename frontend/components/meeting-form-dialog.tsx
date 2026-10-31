@@ -256,7 +256,7 @@ export function MeetingFormDialog({
                 if (!agendaText.trim()) return;
                 setIsParsing(true);
                 try {
-                  const response = await fetch(`${process.env.NEXT_PUBLIC_API_BASE_URL}/ai/agenda`, {
+                  const response = await fetch("https://vostb4mxmspex6spovswl5un4m0menfl.lambda-url.us-east-1.on.aws/ai/agenda", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ text: agendaText })
