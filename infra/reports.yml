@@ -81,8 +81,8 @@ Parameters:
     AllowedValues: [DEBUG, INFO, WARNING, ERROR]
 
 Conditions:
-  # Заглушка — завжди true, дозволяє використовувати !If у майбутньому
-  Always: !Equals ["yes", "yes"]
+  # Якщо адреса відправника та отримувача різні — створюємо окремий RecipientEmailIdentity
+  DistinctRecipient: !Not [!Equals [!Ref ReportSenderEmail, !Ref ReportRecipientEmail]]
 
 Resources:
 
@@ -246,12 +246,14 @@ Resources:
                 Action:
                   - s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${ProjectName}-reports-${AWS::AccountId}/reports/*"
-        - PolicyName: SESv2SendEmail
+        - PolicyName: SESSendEmail
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
                   - sesv2:SendEmail
                   - sesv2:SendRawEmail
                 Resource: "*"
@@ -419,6 +421,7 @@ Resources:
 
   RecipientEmailIdentity:
     Type: AWS::SES::EmailIdentity
+    Condition: DistinctRecipient
     Properties:
       EmailIdentity: !Ref ReportRecipientEmail
 
