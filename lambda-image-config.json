@@ -1,0 +1,10 @@
+{
+    "EntryPoint": [
+        "/usr/local/bin/python",
+        "-m",
+        "awslambdaric"
+    ],
+    "Command": [
+        "app.ai.agenda_lambda.handler"
+    ]
+}

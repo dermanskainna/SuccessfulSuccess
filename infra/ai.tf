@@ -29,16 +29,16 @@ resource "aws_iam_role_policy_attachment" "agenda_parser_basic" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# Permission to invoke Bedrock (CreateInference) for the selected model
+# Permission to invoke Bedrock models (InvokeModel) for the selected model
 resource "aws_iam_role_policy" "agenda_parser_bedrock" {
-  name = "BedrockCreateInference"
+  name = "BedrockInvokeModel"
   role = aws_iam_role.agenda_parser.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
-      Action   = ["bedrock-mantle:CreateInference"]
+      Action   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
       Resource = "*"
     }]
   })
@@ -69,7 +69,7 @@ resource "aws_lambda_function" "agenda_parser" {
 
   environment {
     variables = {
-      PARSER_MODEL = "anthropic.claude-sonnet-4-6"
+      PARSER_MODEL = "us.anthropic.claude-sonnet-4-6"
       APP_TZ      = var.app_timezone
       LOG_LEVEL   = var.log_level
     }

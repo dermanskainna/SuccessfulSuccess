@@ -1,0 +1,10 @@
+{
+    "Variables":  {
+                      "PARSER_MODEL":  "us.anthropic.claude-sonnet-4-6",
+                      "APP_TZ":  "Europe/Kyiv",
+                      "LOG_LEVEL":  "INFO",
+                      "COGNITO_USER_POOL_ID":  "us-east-1_3S0UCWv42",
+                      "COGNITO_CLIENT_ID":  "3rfpq2s4rhl2ap2n49lvpu0k35",
+                      "COGNITO_REGION":  "us-east-1"
+                  }
+}

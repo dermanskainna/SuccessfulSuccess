@@ -32,9 +32,18 @@ IMAGE_PLATFORM = $(if $(filter arm64,$(AWS_LAMBDA_ARCH)),linux/arm64,linux/amd64
 # that supports tags, so Cost Explorer and Resource Groups can find the project.
 STACK_TAGS = --tags "PROJECT_NAME=$(PROJECT_NAME)"
 
-# infra/certificate.sh reuses the CLI configured above. CloudFront only reads
-# certificates from us-east-1, so that is where the frontend's goes.
 CERT = AWS_CLI="$(AWS)" AWS_CERT_REGION=us-east-1 infra/certificate.sh
+
+# Terraform CLI (runs in official container or uses host terraform if available)
+TERRAFORM ?= docker run --rm \
+	-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+	-e AWS_DEFAULT_REGION=$(AWS_REGION) -e AWS_REGION=$(AWS_REGION) \
+	-e TF_CLOUD_ORGANIZATION -e TF_WORKSPACE -e TF_TOKEN_app_terraform_io \
+	-v $(CURDIR)/infra:/infra -w /infra \
+	hashicorp/terraform:latest
+
+# $(call tf-output,<output key>)
+tf-output = $(TERRAFORM) output -raw $(1)
 
 # $(call stack-output,<stack>,<output key>)
 stack-output = $(AWS) cloudformation describe-stacks --stack-name $(1) \
@@ -78,9 +87,9 @@ define require-db-password
 endef
 
 .PHONY: help up up-build down down-v logs ps migrate revision seed test lint fmt shell-backend psql \
-        aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-deploy-backend aws-migrate aws-url aws-status aws-logs \
+        aws-whoami aws-deploy aws-auth-env aws-ecr aws-push aws-deploy-backend aws-migrate aws-url aws-status aws-logs \
         aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy \
-        aws-deploy-reports report-now
+        report-now infra-plan infra-init infra-validate infra-output
 
 REPORTS_STACK ?= $(PROJECT_NAME)-reports
 WEEK ?=
@@ -143,37 +152,24 @@ aws-deploy: ## Deploy everything: sign-in, then the backend, then the frontend b
 	@$(MAKE) --no-print-directory aws-deploy-backend
 	@$(MAKE) --no-print-directory aws-deploy-frontend
 
-aws-deploy-auth: ## Create/update the Cognito user pool (email + password; Google when GOOGLE_CLIENT_ID is set)
+infra-init: ## Initialize Terraform backend and providers
+	$(TERRAFORM) init
+
+infra-validate: ## Validate Terraform HCL syntax and configuration
+	$(TERRAFORM) validate
+
+infra-plan: ## Run terraform plan against HCP Terraform / AWS (applies happen via PR merge in HCP Terraform)
 	$(require-aws-credentials)
-	@urls="http://localhost:$(or $(FRONTEND_PORT),3000)/,http://localhost:$(or $(FRONTEND_PORT),3000)/auth/callback/"; \
-		site=$$($(call stack-output,$(FRONTEND_STACK),AllowedOrigins) 2>/dev/null | tr -d '[:space:]'); \
-		case "$$site" in ""|None) ;; *) urls="$$urls,$$(echo "$$site" | sed 's|,|/,|g')/,$$(echo "$$site" | sed 's|,|/auth/callback/,|g')/auth/callback/" ;; esac; \
-		echo "Sign-in redirect URLs: $$urls"; \
-		test -n "$(GOOGLE_CLIENT_ID)" || echo "GOOGLE_CLIENT_ID is empty — Google sign-in stays off"; \
-		$(call clear-failed-create,$(AUTH_STACK)); \
-		$(AWS) cloudformation deploy \
-			--stack-name $(AUTH_STACK) \
-			--template-file infra/auth.yml \
-			--no-fail-on-empty-changeset \
-			$(STACK_TAGS) \
-		--capabilities CAPABILITY_NAMED_IAM \
-			--parameter-overrides \
-				"ProjectName=$(PROJECT_NAME)" \
-				"AppUrls=$$urls" \
-				"GoogleClientId=$(GOOGLE_CLIENT_ID)" \
-				"GoogleClientSecret=$(GOOGLE_CLIENT_SECRET)"
-	@if [ -n "$(GOOGLE_CLIENT_ID)" ]; then \
-		echo "Google Cloud console → the OAuth client → Authorized redirect URIs must include:"; \
-		echo "  $$($(call stack-output,$(AUTH_STACK),GoogleRedirectUri) | tr -d '[:space:]')"; \
-	fi
-	@$(MAKE) --no-print-directory aws-auth-env
+	$(TERRAFORM) plan
+
+infra-output: ## Show all Terraform outputs
+	$(TERRAFORM) output
 
 aws-auth-env: ## Print the Cognito settings to put in .env for local development
-	@$(call stack-outputs,$(AUTH_STACK)) | awk -F '\t' ' \
-		$$1 == "UserPoolId" { print "COGNITO_USER_POOL_ID=" $$2 } \
-		$$1 == "UserPoolClientId" { print "COGNITO_CLIENT_ID=" $$2 } \
-		$$1 == "HostedDomain" { print "COGNITO_DOMAIN=" $$2 } \
-		$$1 == "GoogleEnabled" { print "COGNITO_GOOGLE_ENABLED=" $$2 }' | tr -d '\r'
+	@echo "COGNITO_USER_POOL_ID=$$($(call tf-output,user_pool_id))"
+	@echo "COGNITO_CLIENT_ID=$$($(call tf-output,user_pool_client_id))"
+	@echo "COGNITO_DOMAIN=$$($(call tf-output,hosted_domain))"
+	@echo "COGNITO_GOOGLE_ENABLED=$$($(call tf-output,google_enabled))"
 
 aws-ecr: ## Create the ECR repository for the backend image
 	$(require-aws-credentials)
@@ -196,10 +192,10 @@ aws-push: aws-ecr ## Build the backend Lambda image and push it to ECR
 aws-deploy-backend: aws-push ## Deploy the backend to AWS (Lambda function URL + Aurora Serverless), then migrate
 	$(require-aws-credentials)
 	$(require-db-password)
-	@pool=$$($(call stack-output,$(AUTH_STACK),UserPoolId) 2>/dev/null | tr -d '[:space:]'); \
-		client=$$($(call stack-output,$(AUTH_STACK),UserPoolClientId) | tr -d '[:space:]'); \
-		issuer=$$($(call stack-output,$(AUTH_STACK),Issuer) | tr -d '[:space:]'); \
-		case "$$pool" in ""|None) echo "No user pool found — run: make aws-deploy-auth"; exit 1 ;; esac; \
+	@pool=$$($(call tf-output,user_pool_id) 2>/dev/null || $(call stack-output,$(AUTH_STACK),UserPoolId) 2>/dev/null | tr -d '[:space:]'); \
+		client=$$($(call tf-output,user_pool_client_id) 2>/dev/null || $(call stack-output,$(AUTH_STACK),UserPoolClientId) | tr -d '[:space:]'); \
+		issuer=$$($(call tf-output,issuer) 2>/dev/null || $(call stack-output,$(AUTH_STACK),Issuer) | tr -d '[:space:]'); \
+		case "$$pool" in ""|None) echo "No user pool found — run Terraform plan/apply or check auth stack"; exit 1 ;; esac; \
 		jwks=$$(curl -fsS "$$issuer/.well-known/jwks.json" | base64 | tr -d '\n'); \
 		test -n "$$jwks" || { echo "Could not download $$issuer/.well-known/jwks.json"; exit 1; }; \
 		vpc=$$($(AWS) ec2 describe-vpcs --filters Name=isDefault,Values=true \
@@ -298,11 +294,12 @@ aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront, built against th
 				"ProjectName=$(PROJECT_NAME)" \
 				"PricingPlan=$(or $(AWS_CLOUDFRONT_PLAN),FREE)" \
 				$$domain
-	@# Now that the site's URL exists, let Cognito redirect back to it.
-	@$(MAKE) --no-print-directory aws-deploy-auth
 	@api=$$($(call stack-output,$(APP_STACK),ApiUrl) | tr -d '[:space:]'); \
-		auth=$$($(call stack-outputs,$(AUTH_STACK)) | tr -d '\r'); \
-		auth_out() { printf '%s\n' "$$auth" | awk -F '\t' -v k="$$1" '$$1 == k { print $$2 }'; }; \
+		pool_id=$$($(call tf-output,user_pool_id) 2>/dev/null || $(call stack-output,$(AUTH_STACK),UserPoolId) | tr -d '[:space:]'); \
+		client_id=$$($(call tf-output,user_pool_client_id) 2>/dev/null || $(call stack-output,$(AUTH_STACK),UserPoolClientId) | tr -d '[:space:]'); \
+		domain_name=$$($(call tf-output,hosted_domain) 2>/dev/null || $(call stack-output,$(AUTH_STACK),HostedDomain) | tr -d '[:space:]'); \
+		domain_pfx=$$($(call tf-output,domain_prefix) 2>/dev/null || $(call stack-output,$(AUTH_STACK),DomainPrefix) | tr -d '[:space:]'); \
+		google_en=$$($(call tf-output,google_enabled) 2>/dev/null || $(call stack-output,$(AUTH_STACK),GoogleEnabled) | tr -d '[:space:]'); \
 		bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) | tr -d '[:space:]'); \
 		dist=$$($(call stack-output,$(FRONTEND_STACK),DistributionId) | tr -d '[:space:]'); \
 		echo "Building the static export against $$api"; \
@@ -310,12 +307,12 @@ aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront, built against th
 		if docker info >/dev/null 2>&1; then \
 			docker build --target export --output type=local,dest=frontend/out \
 				--build-arg NEXT_PUBLIC_API_BASE_URL="$$api" \
-				--build-arg NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$(auth_out UserPoolId)" \
-				--build-arg NEXT_PUBLIC_COGNITO_CLIENT_ID="$$(auth_out UserPoolClientId)" \
-				--build-arg NEXT_PUBLIC_COGNITO_DOMAIN="$$(auth_out HostedDomain)" \
-				--build-arg NEXT_PUBLIC_COGNITO_DOMAIN_PREFIX="$$(auth_out DomainPrefix)" \
+				--build-arg NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$pool_id" \
+				--build-arg NEXT_PUBLIC_COGNITO_CLIENT_ID="$$client_id" \
+				--build-arg NEXT_PUBLIC_COGNITO_DOMAIN="$$domain_name" \
+				--build-arg NEXT_PUBLIC_COGNITO_DOMAIN_PREFIX="$$domain_pfx" \
 				--build-arg NEXT_PUBLIC_AWS_REGION="$(AWS_REGION)" \
-				--build-arg NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$(auth_out GoogleEnabled)" \
+				--build-arg NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$google_en" \
 				./frontend || exit 1; \
 		else \
 			echo "Docker daemon not running, building export with npm..."; \
@@ -323,12 +320,12 @@ aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront, built against th
 				NEXT_TELEMETRY_DISABLED=1 \
 				NEXT_OUTPUT=export \
 				NEXT_PUBLIC_API_BASE_URL="$$api" \
-				NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$(auth_out UserPoolId)" \
-				NEXT_PUBLIC_COGNITO_CLIENT_ID="$$(auth_out UserPoolClientId)" \
-				NEXT_PUBLIC_COGNITO_DOMAIN="$$(auth_out HostedDomain)" \
-				NEXT_PUBLIC_COGNITO_DOMAIN_PREFIX="$$(auth_out DomainPrefix)" \
+				NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$pool_id" \
+				NEXT_PUBLIC_COGNITO_CLIENT_ID="$$client_id" \
+				NEXT_PUBLIC_COGNITO_DOMAIN="$$domain_name" \
+				NEXT_PUBLIC_COGNITO_DOMAIN_PREFIX="$$domain_pfx" \
 				NEXT_PUBLIC_AWS_REGION="$(AWS_REGION)" \
-				NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$(auth_out GoogleEnabled)" \
+				NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$google_en" \
 				npm run build) || exit 1; \
 		fi; \
 		echo "Uploading to s3://$$bucket"; \
@@ -396,9 +393,9 @@ aws-deploy-reports: aws-push ## Deploy the event-driven weekly reports stack (S3
 
 report-now: ## Trigger a weekly report manually via SQS: make report-now [WEEK=2026-W40]
 	$(require-aws-credentials)
-	@q_url=$$($(call stack-output,$(REPORTS_STACK),ReportRequestsQueueUrl) 2>/dev/null | tr -d '[:space:]'); \
+	@q_url=$$($(call tf-output,report_requests_queue_url) 2>/dev/null || $(call stack-output,$(REPORTS_STACK),ReportRequestsQueueUrl) 2>/dev/null | tr -d '[:space:]'); \
 		test -n "$$q_url" -a "$$q_url" != "None" || { \
-			echo "Reports stack is not deployed or queue not found. Run make aws-deploy-reports first."; exit 1; }; \
+			echo "Reports queue not found. Run Terraform plan/apply or check reports stack first."; exit 1; }; \
 		if [ -n "$(WEEK)" ]; then \
 			payload='{"week": "$(WEEK)", "source": "manual"}'; \
 		else \

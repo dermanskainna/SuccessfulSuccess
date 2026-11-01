@@ -75,36 +75,43 @@ make psql        # psql shell against the app database
 make help        # everything else
 ```
 
-## Deploy to AWS
+## Infrastructure as Code & Deployment
 
-`infra/` holds four CloudFormation templates: `auth.yml` (Cognito sign-in),
-`ecr.yml` (image registry), `backend.yml` (API and database) and `frontend.yml`
-(site). `make` reads `.env`,
-so the `aws-*` targets pick up the credentials and settings from there; `.env` is
-gitignored, so real keys never reach the repository. The AWS CLI runs in the
-`amazon/aws-cli` container, so nothing has to be installed on the host besides
-Docker (`AWS=aws make aws-deploy` uses a local CLI instead, which is noticeably
-faster).
+Infrastructure for SuccessfulSuccess has been migrated to **Terraform (HCL)** with **HCP Terraform (HashiCorp Cloud Platform)** remote backend:
+- `infra/versions.tf` — Terraform configuration (>= 1.10), AWS provider (~> 6.0), random & tls providers, and `cloud {}` HCP Terraform backend.
+- `infra/auth.tf` — Cognito user pool, hosted domain, Google IdP, and web client.
+- `infra/reports.tf` — Weekly meetings report pipeline: S3 bucket, lifecycle, SQS queues, Lambda functions (builder in VPC, mailer outside VPC), SES identities, and EventBridge Scheduler.
+- `infra/ai.tf` — Agenda parser Lambda function, public Function URL with CORS, IAM roles, and Bedrock inference permissions.
+- `infra/variables.tf` & `infra/outputs.tf` — Modular input variables with sensitive handling and output exports.
+
+### HCP Terraform Workflow
+
+1. **Remote Execution & State**: Infrastructure state is centrally managed within the `SuccessfulSuccess` organization in HCP Terraform.
+2. **Pull Request Automation**: Creating or updating a Pull Request triggers speculative execution (`terraform plan`) in HCP Terraform.
+3. **Merge Deployment**: Merging to `main` executes `terraform apply` remotely. Direct `terraform apply` from developer machines or the Makefile is strictly prohibited to maintain state integrity and traceability.
+4. **Local Planning**:
+   ```bash
+   make infra-init       # Initialize HCP Terraform cloud integration
+   make infra-validate   # Validate HCL syntax and references
+   make infra-plan       # Run speculative plan against HCP Terraform
+   make infra-output     # Read live outputs (user pool IDs, function URLs, etc.)
+   ```
+
+### Deploy to AWS
 
 ```
 browser ──https──→ CloudFront (optional custom domain) → private S3 bucket (Next.js static export)
    └────https──→ Lambda function URL → Lambda → Aurora Serverless v2 :5432
 ```
 
-Every resource lives in `AWS_REGION`, **us-east-1** by default, which is also
-where CloudFront reads its certificates from. There is no API Gateway or load
-balancer: the browser calls the API on its function URL, and FastAPI's CORS
-settings allow it.
-
-Every stack is tagged `PROJECT_NAME=<value of PROJECT_NAME>`, and every resource
-that accepts tags also carries it explicitly in the templates. Filter by it in
-Cost Explorer or Resource Groups to see everything the project owns.
+Every resource lives in `AWS_REGION`, **us-east-1** by default. All resources are tagged `PROJECT_NAME=<PROJECT_NAME>` and `ManagedBy=terraform`. Filter by these tags in AWS Cost Explorer or Resource Groups.
 
 ### One command
 
 ```bash
 make aws-whoami   # check the credentials work
-make aws-deploy   # sign-in, then the backend, then the frontend built against both
+make infra-plan   # review planned infrastructure changes in HCP Terraform
+make aws-deploy   # deploy backend and frontend against the infrastructure
 ```
 
 `aws-deploy` runs `aws-deploy-auth` and then the two steps below in order: the
