@@ -69,7 +69,7 @@ resource "aws_lambda_function" "agenda_parser" {
 
   environment {
     variables = {
-      PARSER_MODEL = "claude-sonnet-4-6"
+      PARSER_MODEL = "anthropic.claude-sonnet-4-6"
       APP_TZ      = var.app_timezone
       LOG_LEVEL   = var.log_level
     }
