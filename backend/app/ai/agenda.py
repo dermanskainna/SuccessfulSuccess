@@ -25,9 +25,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 logger = logging.getLogger("meetings.ai.agenda")
 
-# Pricing for anthropic.claude-opus-5-5: $4.00 / MTok in, $20.00 / MTok out
-INPUT_COST_PER_MTOK = 4.00
-OUTPUT_COST_PER_MTOK = 20.00
+# Pricing for claude-sonnet-4-6: $3.00 / MTok in, $15.00 / MTok out
+INPUT_COST_PER_MTOK = 3.00
+OUTPUT_COST_PER_MTOK = 15.00
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -89,7 +89,8 @@ def _get_client():
 def parse_agenda(text: str, today: date, tz: str) -> Tuple[ParsedAgenda, Dict[str, Any]]:
     """Parse raw agenda text into a ParsedAgenda using Claude on Amazon Bedrock."""
     client = _get_client()
-    model = os.getenv("PARSER_MODEL", "anthropic.claude-opus-5-5")
+    # Use a Bedrock model that is available for this account.
+    model = os.getenv("PARSER_MODEL", "claude-sonnet-4-6")
     prompt_version = "v1"
 
     system_prompt = (
