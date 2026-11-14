@@ -1,6 +1,9 @@
 #!/bin/sh
 set -e
 
-# Migrations disabled
+if [ "${RUN_MIGRATIONS_ON_START:-false}" = "true" ]; then
+  echo "Running database migrations..."
+  alembic upgrade head
+fi
 
 exec "$@"

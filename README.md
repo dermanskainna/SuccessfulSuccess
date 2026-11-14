@@ -354,6 +354,85 @@ cd frontend && npm ci && npm run lint
 
 There is no deploy (CD) stage — no target is configured yet.
 
+## GCP Deployment (Cloud Run + Cloud SQL)
+
+The `gcp/` folder contains a separate Terraform stack that runs the FastAPI backend on
+Google Cloud Platform in parallel with the existing AWS infrastructure.
+
+### What runs on GCP
+
+| Service | Resource |
+|---------|----------|
+| FastAPI backend | Cloud Run (`successfulsuccess-api`) |
+| PostgreSQL 16 | Cloud SQL (`successfulsuccess-pg-*`) |
+| Docker images | Artifact Registry (`us-central1-docker.pkg.dev/…/successfulsuccess-repo`) |
+| Frontend | Firebase Hosting (`successfulsuccess-inna-2026.web.app`) |
+
+### What stays on AWS
+
+| Service | Resource |
+|---------|----------|
+| Auth | Cognito User Pool `us-east-1_3S0UCWv42` |
+| AI parser | Lambda + Bedrock (Claude) via Lambda URL |
+| Reports pipeline | SQS → Lambda → S3 → SES |
+| Infra state | HCP Terraform workspace `successfulsuccess-aws` |
+
+### Deploy GCP infrastructure
+
+```powershell
+# From repo root (Terraform via Docker — no local terraform.exe needed)
+cd gcp
+docker run --rm `
+  -v "${PWD}:/workspace" -w /workspace `
+  -v "${env:APPDATA}\gcloud:/root/.config/gcloud" `
+  -v "${env:APPDATA}\terraform.d:/root/.terraform.d" `
+  -e GOOGLE_APPLICATION_CREDENTIALS="/root/.config/gcloud/application_default_credentials.json" `
+  hashicorp/terraform:1.10 apply -auto-approve
+```
+
+### Deploy / update backend image
+
+```powershell
+# 1. Authenticate Docker (ADC token, refreshed each session)
+$token = gcloud auth application-default print-access-token
+echo $token | docker login -u oauth2accesstoken --password-stdin us-central1-docker.pkg.dev
+
+# 2. Build & push
+docker build -t us-central1-docker.pkg.dev/successfulsuccess-inna-2026/successfulsuccess-repo/api:v1 ./backend
+docker push us-central1-docker.pkg.dev/successfulsuccess-inna-2026/successfulsuccess-repo/api:v1
+
+# 3. Apply Terraform to redeploy Cloud Run with new image
+cd gcp && docker run --rm ... hashicorp/terraform:1.10 apply -auto-approve
+```
+
+### Deploy frontend to Firebase Hosting
+
+```powershell
+# Build static export
+cd frontend
+$env:NEXT_OUTPUT = "export"; npm run build   # generates frontend/out/
+
+# Deploy (from repo root)
+cd ..
+npx -y firebase-tools deploy --only hosting --project successfulsuccess-inna-2026
+```
+
+### Stop / destroy Cloud SQL (cost saving)
+
+To **pause** the DB without destroying data, set `activation_policy = "NEVER"` in
+`gcp/main.tf` → `google_sql_database_instance.main.settings` and run `terraform apply`.
+
+To **destroy all GCP resources**:
+```powershell
+cd gcp
+# 1. Disable deletion protection first:
+#    Set deletion_protection = false in google_sql_database_instance + apply
+# 2. Then destroy:
+docker run --rm ... hashicorp/terraform:1.10 destroy -auto-approve
+```
+
+---
+
 ## Development notes
 
 - The backend bind-mounts `./backend`, so `uvicorn --reload` picks up edits live.
