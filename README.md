@@ -80,7 +80,6 @@ make help        # everything else
 Infrastructure for SuccessfulSuccess has been migrated to **Terraform (HCL)** with **HCP Terraform (HashiCorp Cloud Platform)** remote backend:
 - `infra/versions.tf` — Terraform configuration (>= 1.10), AWS provider (~> 6.0), random & tls providers, and `cloud {}` HCP Terraform backend.
 - `infra/auth.tf` — Cognito user pool, hosted domain, Google IdP, and web client.
-- `infra/reports.tf` — Weekly meetings report pipeline: S3 bucket, lifecycle, SQS queues, Lambda functions (builder in VPC, mailer outside VPC), SES identities, and EventBridge Scheduler.
 - `infra/ai.tf` — Agenda parser Lambda function, public Function URL with CORS, IAM roles, and Bedrock inference permissions.
 - `infra/variables.tf` & `infra/outputs.tf` — Modular input variables with sensitive handling and output exports.
 
@@ -374,7 +373,6 @@ Google Cloud Platform in parallel with the existing AWS infrastructure.
 |---------|----------|
 | Auth | Cognito User Pool `us-east-1_3S0UCWv42` |
 | AI parser | Lambda + Bedrock (Claude) via Lambda URL |
-| Reports pipeline | SQS → Lambda → S3 → SES |
 | Infra state | HCP Terraform workspace `successfulsuccess-aws` |
 
 ### Deploy GCP infrastructure

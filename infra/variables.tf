@@ -47,38 +47,8 @@ variable "google_client_secret" {
 }
 
 # -----------------------------------------------------------------------------
-# Reports Stack Variables
+# Common / Lambda Variables
 # -----------------------------------------------------------------------------
-
-variable "vpc_id" {
-  description = "VPC ID where the backend and Aurora DB reside (used for Lambda builder and S3 gateway endpoint)."
-  type        = string
-  default     = ""
-}
-
-variable "subnet_ids" {
-  description = "Private subnet IDs for the report builder Lambda."
-  type        = list(string)
-  default     = []
-}
-
-variable "route_table_ids" {
-  description = "Route table IDs for subnets hosting the builder Lambda, used for the S3 Gateway VPCEndpoint."
-  type        = list(string)
-  default     = []
-}
-
-variable "security_group_id" {
-  description = "Security Group ID for the report builder Lambda (allowing access to Aurora PostgreSQL)."
-  type        = string
-  default     = ""
-}
-
-variable "reports_image_uri" {
-  description = "ECR container image URI (with tag or digest) for report builder and mailer Lambdas."
-  type        = string
-  default     = ""
-}
 
 variable "architecture" {
   description = "Instruction set architecture for Lambda functions (x86_64 or arm64)."
@@ -88,31 +58,6 @@ variable "architecture" {
     condition     = contains(["x86_64", "arm64"], var.architecture)
     error_message = "architecture must be either 'x86_64' or 'arm64'."
   }
-}
-
-variable "builder_timeout" {
-  description = "Timeout in seconds for report builder Lambda."
-  type        = number
-  default     = 60
-}
-
-variable "database_url" {
-  description = "Database connection URL to Aurora PostgreSQL (postgresql+asyncpg://...)."
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
-variable "report_sender_email" {
-  description = "Email address for report sender (verified in SES)."
-  type        = string
-  default     = "reports@example.com"
-}
-
-variable "report_recipient_email" {
-  description = "Email address for report recipient (verified in SES)."
-  type        = string
-  default     = "admin@example.com"
 }
 
 variable "log_level" {
